@@ -1,0 +1,169 @@
+name: Release
+
+# Publishes each release the private source repository hands over. Its release job pushes a branch
+# incoming/<tag> holding the signed APK with its .sha256, the notes (notes.md) and the plan
+# (release.json: tag, title, source commit, channel, version, build number, and `draft: true` to
+# publish a draft for testing). This builds the IPA from that commit, publishes the release with
+# both and deletes the branch. A manual run builds the IPA of any source commit or branch as a
+# test and publishes nothing.
+on:
+  push:
+    branches: ["incoming/**"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Source commit or branch to build the IPA from (a test: nothing is published)"
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: Elsen823/lumen-ai
+
+# One release at a time, in the order they arrive; none is cancelled or dropped.
+concurrency:
+  group: release
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  ios:
+    name: iOS IPA (unsigned, for sideloading)
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: handoff
+
+      - name: Read the plan
+        id: plan
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            plan=handoff/release.json
+            {
+              echo "tag=$(jq -r .tag "$plan")"
+              echo "ref=$(jq -r .ref "$plan")"
+              echo "version=$(jq -r .version "$plan")"
+              echo "version_code=$(jq -r .versionCode "$plan")"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "tag=test-$GITHUB_RUN_NUMBER"
+              echo "ref=$INPUT_REF"
+              echo "version="
+              echo "version_code=1"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      # The source repository is private; its read-only deploy key is this repository's secret.
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ steps.plan.outputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          path: source
+
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: source/package.json
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: source/pnpm-lock.yaml
+
+      - run: pnpm install --frozen-lockfile
+        working-directory: source
+
+      # ios/ is generated, never committed; prebuild also installs the pods. The Xcode build reads
+      # app.config.ts again to embed it in the app, so it gets the version too.
+      - name: Generate the iOS project
+        working-directory: source/apps/mobile
+        env:
+          APP_VERSION: ${{ steps.plan.outputs.version }}
+          ANDROID_VERSION_CODE: ${{ steps.plan.outputs.version_code }}
+        run: pnpm exec expo prebuild --platform ios
+
+      # No Apple signing here: sideloading tools (SideStore, Sideloadly) sign the app with the
+      # installer's own Apple ID.
+      - name: Build the app without signing
+        working-directory: source/apps/mobile/ios
+        env:
+          APP_VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          set -o pipefail
+          workspace=$(ls -d *.xcworkspace | head -n 1)
+          xcodebuild build \
+            -workspace "$workspace" \
+            -scheme "${workspace%.xcworkspace}" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            | xcbeautify --renderer github-actions
+
+      - name: Package the IPA
+        id: ipa
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          name="lumen-ai-$TAG.ipa"
+          mkdir Payload
+          cp -R source/apps/mobile/ios/build/Build/Products/Release-iphoneos/*.app Payload/
+          zip -qry "$name" Payload
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          shasum -a 256 "$name" | tee "$name.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lumen-ai-ipa
+          path: |
+            ${{ steps.ipa.outputs.name }}
+            ${{ steps.ipa.outputs.name }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: ios
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: handoff
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: lumen-ai-ipa
+
+      # The tag goes on this repository's main. A nightly is a pre-release and never the latest
+      # release; a stable release is.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          plan=handoff/release.json
+          flags=(--title "$(jq -r .title "$plan")" --target main --notes-file handoff/notes.md)
+          if [ "$(jq -r .channel "$plan")" = nightly ]; then
+            flags+=(--prerelease --latest=false)
+          else
+            flags+=(--latest)
+          fi
+          if [ "$(jq -r '.draft // false' "$plan")" = true ]; then flags+=(--draft); fi
+          gh release create "$(jq -r .tag "$plan")" handoff/lumen-ai-*.apk* lumen-ai-*.ipa* \
+            --repo "$GITHUB_REPOSITORY" "${flags[@]}"
+
+      - name: Delete the handoff branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$GITHUB_REF_NAME"
