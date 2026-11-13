@@ -152,7 +152,8 @@ jobs:
             -destination "generic/platform=iOS" \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            DEBUG_INFORMATION_FORMAT=dwarf             C_COMPILER_LAUNCHER="$(command -v ccache)" CLANG_ENABLE_EXPLICIT_MODULES=NO \
+            DEBUG_INFORMATION_FORMAT=dwarf \
+            C_COMPILER_LAUNCHER="$(command -v ccache)" CLANG_ENABLE_EXPLICIT_MODULES=NO \
             | xcbeautify --renderer github-actions
           ccache --show-stats
 
