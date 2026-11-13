@@ -201,7 +201,8 @@ jobs:
           path: handoff
 
       # The source repository pushes the APK to this branch once it's built and checked, or
-      # deletes the branch when the release fails there.
+      # deletes the branch when the release fails there. A stable release planned again after
+      # that comes back on a branch of the same name, with another plan: that's not this run's.
       - name: Wait for the APK
         working-directory: handoff
         run: |
@@ -213,7 +214,12 @@ jobs:
               echo "::error::The source repository withdrew this release: its branch is gone."
               exit 1
             fi
-            git fetch -q --depth 1 origin "$GITHUB_REF_NAME" && git checkout -q FETCH_HEAD || true
+            git fetch -q --depth 1 origin "$GITHUB_REF_NAME" || continue
+            if ! git diff --quiet "$GITHUB_SHA" FETCH_HEAD -- release.json; then
+              echo "::error::The source repository withdrew this release and planned it again: its branch holds another plan."
+              exit 1
+            fi
+            git checkout -q FETCH_HEAD
           done
           ls lumen-ai-*.apk*
 
