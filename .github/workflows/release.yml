@@ -42,8 +42,9 @@ jobs:
       # The previous build's compiler cache is an artifact of its run.
       actions: read
     env:
-      # ccache's default directory: Xcode runs the compiler without this job's environment.
-      CCACHE_DIR: /Users/runner/Library/Caches/ccache
+      # ccache's default directory. ccache runs under Xcode, without this job's environment, so it
+      # keeps its defaults and its own config file.
+      COMPILER_CACHE: /Users/runner/Library/Caches/ccache
     steps:
       - uses: actions/checkout@v7
         with:
@@ -99,7 +100,11 @@ jobs:
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
           HOMEBREW_NO_INSTALL_CLEANUP: "1"
-        run: command -v ccache || brew install --quiet ccache
+        run: |
+          command -v ccache || brew install --quiet ccache
+          # React Native's settings for Xcode builds (react-native/scripts/xcode/ccache.conf).
+          ccache --set-config=sloppiness=clang_index_store,file_stat_matches,include_file_ctime,include_file_mtime,ivfsoverlay,pch_defines,modules,system_headers,time_macros
+          ccache --set-config=depend_mode=true
 
       - name: Find the previous build's compiler cache
         id: previous
@@ -114,24 +119,23 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: ccache-ios
-          path: ${{ env.CCACHE_DIR }}
+          path: ${{ env.COMPILER_CACHE }}
           run-id: ${{ steps.previous.outputs.run }}
           github-token: ${{ github.token }}
 
-      # ios/ is generated, never committed; prebuild also installs the pods, which with USE_CCACHE
-      # compile through ccache. The Xcode build reads app.config.ts again to embed it in the app,
-      # so it gets the version too.
+      # ios/ is generated, never committed; prebuild also installs the pods. The Xcode build reads
+      # app.config.ts again to embed it in the app, so it gets the version too.
       - name: Generate the iOS project
         working-directory: source/apps/mobile
         env:
           APP_VERSION: ${{ steps.plan.outputs.version }}
           ANDROID_VERSION_CODE: ${{ steps.plan.outputs.version_code }}
-          USE_CCACHE: "1"
         run: pnpm exec expo prebuild --platform ios
 
       # No Apple signing here: sideloading tools (SideStore, Sideloadly) sign the app with the
-      # installer's own Apple ID. Nothing uses a dSYM, so none is made. Xcode passes over ccache
-      # when it builds C modules explicitly, so it builds them implicitly here, which ccache keeps.
+      # installer's own Apple ID. Nothing uses a dSYM, so none is made. Every compile goes through
+      # ccache as Xcode's compiler launcher; ccache can't cache explicitly built C modules, so
+      # they're built implicitly.
       - name: Build the app without signing
         working-directory: source/apps/mobile/ios
         env:
@@ -148,7 +152,7 @@ jobs:
             -destination "generic/platform=iOS" \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            DEBUG_INFORMATION_FORMAT=dwarf CLANG_ENABLE_EXPLICIT_MODULES=NO \
+            DEBUG_INFORMATION_FORMAT=dwarf             C_COMPILER_LAUNCHER="$(command -v ccache)" CLANG_ENABLE_EXPLICIT_MODULES=NO \
             | xcbeautify --renderer github-actions
           ccache --show-stats
 
@@ -176,7 +180,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: ccache-ios
-          path: ${{ env.CCACHE_DIR }}
+          path: ${{ env.COMPILER_CACHE }}
           include-hidden-files: true
           compression-level: 0
           retention-days: 30
