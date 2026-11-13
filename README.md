@@ -20,8 +20,9 @@ releases only; a nightly install is offered whichever is newer.
 
 ## How releases get here
 
-The source repository's CI builds and signs the APK, then pushes it with the notes and the plan
-to a branch `incoming/<tag>` here. [The release workflow](.github/workflows/release.yml) builds
-the IPA from the same source commit, publishes the release and deletes the branch. It reads the
-source through a read-only deploy key, the `SOURCE_DEPLOY_KEY` secret; the source repository
-pushes with a deploy key of this one.
+When the source repository's CI plans a release, it pushes the plan and the notes to a branch
+`incoming/<tag>` here. [The release workflow](.github/workflows/release.yml) builds the IPA from
+the source commit while that CI builds and signs the APK, which it then pushes to the same branch.
+The workflow publishes the release with both and deletes the branch. It reads the source through a
+read-only deploy key, the `SOURCE_DEPLOY_KEY` secret; the source repository pushes with a deploy
+key of this one.
