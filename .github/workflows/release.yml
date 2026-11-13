@@ -42,7 +42,8 @@ jobs:
       # The previous build's compiler cache is an artifact of its run.
       actions: read
     env:
-      CCACHE_DIR: ${{ github.workspace }}/ccache
+      # ccache's default directory: Xcode runs the compiler without this job's environment.
+      CCACHE_DIR: /Users/runner/Library/Caches/ccache
     steps:
       - uses: actions/checkout@v7
         with:
@@ -129,14 +130,12 @@ jobs:
         run: pnpm exec expo prebuild --platform ios
 
       # No Apple signing here: sideloading tools (SideStore, Sideloadly) sign the app with the
-      # installer's own Apple ID. Nothing uses a dSYM, so none is made.
+      # installer's own Apple ID. Nothing uses a dSYM, so none is made. Xcode passes over ccache
+      # when it builds C modules explicitly, so it builds them implicitly here, which ccache keeps.
       - name: Build the app without signing
         working-directory: source/apps/mobile/ios
         env:
           APP_VERSION: ${{ steps.plan.outputs.version }}
-          # The compiler's version, rather than its file time, which a new runner image changes.
-          CCACHE_COMPILERCHECK: "%compiler% --version"
-          CCACHE_MAXSIZE: 2G
         run: |
           set -o pipefail
           ccache --zero-stats > /dev/null
@@ -149,7 +148,7 @@ jobs:
             -destination "generic/platform=iOS" \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            DEBUG_INFORMATION_FORMAT=dwarf \
+            DEBUG_INFORMATION_FORMAT=dwarf CLANG_ENABLE_EXPLICIT_MODULES=NO \
             | xcbeautify --renderer github-actions
           ccache --show-stats
 
