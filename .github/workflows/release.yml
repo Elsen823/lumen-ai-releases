@@ -1,14 +1,18 @@
 name: Release
 
-# Publishes each release the private source repository hands over. Its release job pushes a branch
-# incoming/<tag> holding the signed APK with its .sha256, the notes (notes.md) and the plan
-# (release.json: tag, title, source commit, channel, version, build number, and `draft: true` to
-# publish a draft for testing). This builds the IPA from that commit, publishes the release with
-# both and deletes the branch. A manual run builds the IPA of any source commit or branch as a
-# test and publishes nothing.
+# Publishes each release the private source repository hands over on a branch incoming/<tag>. Its
+# first push holds the plan (release.json: tag, title, source commit, channel, version, build
+# number, and `draft: true` to publish a draft for testing) and the notes (notes.md). That push
+# starts this workflow, which builds the IPA from the source commit while the source repository
+# builds the APK. Once the APK is built and checked, a second push adds it with its .sha256; that
+# push changes no plan and starts no run. This then publishes the release with both files and
+# deletes the branch. When a release fails in the source repository, it deletes the branch
+# instead. A manual run builds the IPA of any source commit or branch as a test and publishes
+# nothing.
 on:
   push:
     branches: ["incoming/**"]
+    paths: ["release.json"]
   workflow_dispatch:
     inputs:
       ref:
@@ -33,6 +37,12 @@ jobs:
     name: iOS IPA (unsigned, for sideloading)
     runs-on: macos-26
     timeout-minutes: 60
+    permissions:
+      contents: read
+      # The previous build's compiler cache is an artifact of its run.
+      actions: read
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/ccache
     steps:
       - uses: actions/checkout@v7
         with:
@@ -72,32 +82,64 @@ jobs:
         with:
           package_json_file: source/package.json
 
+      # No pnpm cache: each release runs on its own branch, which can't see the last one's cache,
+      # and saving one took longer than the install saved.
       - uses: actions/setup-node@v7
         with:
           node-version: "24"
-          cache: pnpm
-          cache-dependency-path: source/pnpm-lock.yaml
 
       - run: pnpm install --frozen-lockfile
         working-directory: source
 
-      # ios/ is generated, never committed; prebuild also installs the pods. The Xcode build reads
-      # app.config.ts again to embed it in the app, so it gets the version too.
+      # Most of the build is compiling the libraries' native code, which rarely changes between
+      # releases. ccache keeps it from the previous build. Actions caches don't reach from one
+      # incoming/ branch to the next, so the cache travels as an artifact of the latest build.
+      - name: Install ccache
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: command -v ccache || brew install --quiet ccache
+
+      - name: Find the previous build's compiler cache
+        id: previous
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=ccache-ios&per_page=1" \
+            --jq '.artifacts[] | select(.expired | not) | .workflow_run.id')
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+      - if: steps.previous.outputs.run != ''
+        uses: actions/download-artifact@v8
+        with:
+          name: ccache-ios
+          path: ${{ env.CCACHE_DIR }}
+          run-id: ${{ steps.previous.outputs.run }}
+          github-token: ${{ github.token }}
+
+      # ios/ is generated, never committed; prebuild also installs the pods, which with USE_CCACHE
+      # compile through ccache. The Xcode build reads app.config.ts again to embed it in the app,
+      # so it gets the version too.
       - name: Generate the iOS project
         working-directory: source/apps/mobile
         env:
           APP_VERSION: ${{ steps.plan.outputs.version }}
           ANDROID_VERSION_CODE: ${{ steps.plan.outputs.version_code }}
+          USE_CCACHE: "1"
         run: pnpm exec expo prebuild --platform ios
 
       # No Apple signing here: sideloading tools (SideStore, Sideloadly) sign the app with the
-      # installer's own Apple ID.
+      # installer's own Apple ID. Nothing uses a dSYM, so none is made.
       - name: Build the app without signing
         working-directory: source/apps/mobile/ios
         env:
           APP_VERSION: ${{ steps.plan.outputs.version }}
+          # The compiler's version, rather than its file time, which a new runner image changes.
+          CCACHE_COMPILERCHECK: "%compiler% --version"
+          CCACHE_MAXSIZE: 2G
         run: |
           set -o pipefail
+          ccache --zero-stats > /dev/null
           workspace=$(ls -d *.xcworkspace | head -n 1)
           xcodebuild build \
             -workspace "$workspace" \
@@ -107,7 +149,9 @@ jobs:
             -destination "generic/platform=iOS" \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            DEBUG_INFORMATION_FORMAT=dwarf \
             | xcbeautify --renderer github-actions
+          ccache --show-stats
 
       - name: Package the IPA
         id: ipa
@@ -129,18 +173,45 @@ jobs:
             ${{ steps.ipa.outputs.name }}.sha256
           if-no-files-found: error
 
+      # ccache compresses its entries already.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ccache-ios
+          path: ${{ env.CCACHE_DIR }}
+          include-hidden-files: true
+          compression-level: 0
+          retention-days: 30
+
   release:
     name: Publish release
     needs: ios
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Mostly waiting for the APK, which the source repository builds alongside the IPA.
+    timeout-minutes: 70
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v7
         with:
           path: handoff
+
+      # The source repository pushes the APK to this branch once it's built and checked, or
+      # deletes the branch when the release fails there.
+      - name: Wait for the APK
+        working-directory: handoff
+        run: |
+          until ls lumen-ai-*.apk > /dev/null 2>&1; do
+            sleep 15
+            # A failed lookup is retried; an empty one means the branch is gone.
+            heads=$(git ls-remote origin "refs/heads/$GITHUB_REF_NAME") || continue
+            if [ -z "$heads" ]; then
+              echo "::error::The source repository withdrew this release: its branch is gone."
+              exit 1
+            fi
+            git fetch -q --depth 1 origin "$GITHUB_REF_NAME" && git checkout -q FETCH_HEAD || true
+          done
+          ls lumen-ai-*.apk*
 
       - uses: actions/download-artifact@v8
         with:
